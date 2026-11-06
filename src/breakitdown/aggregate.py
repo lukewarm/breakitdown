@@ -36,6 +36,7 @@ FLIGHT = "__flight"
 DAY = "__day"
 TS = "__ts"
 EXPOSURE_DAY = "__exposure_day"
+ORDER = "__order"  # a row's time, for finding each unit's earliest row
 EXPOSURE_TS = "__exposure_ts"
 FIRST_DAY = "__first_day"
 VALUE = "__value"
@@ -125,7 +126,7 @@ def _in_period(day: Column, period: Period) -> Column:
 # ----------------------------------------------------------------------------------- preparation
 
 
-def prepare_prejoined(
+def prejoined_rows(
     df: DataFrame,
     columns: Columns,
     period: Period,
@@ -134,8 +135,12 @@ def prepare_prejoined(
     metric_segment_cols: Sequence[str],
     inputs: Sequence[str],
     where: str,
-) -> Prepared:
-    """Rows and population of a table that already carries flight and user segments on every row."""
+) -> DataFrame:
+    """Rows of a pre-joined table in the date range and the experiment's flights, with internal names.
+
+    User segment columns keep their raw values (NULLs included); ``prepare_prejoined`` reduces them to
+    one value per unit. ORDER (the row's time) and, with an exposure column, EXPOSURE_DAY ride along.
+    """
     exposure = columns.exposure
     require_columns(
         df,
@@ -146,8 +151,8 @@ def prepare_prejoined(
     day = day_column(df, columns.time, columns.time_format)
     flight = F.col(quote(columns.flight)).cast("string")
     keep = _in_period(day, period) & flight.isin(list(flights)) & F.col(quote(columns.unit)).isNotNull()
-    selects = [F.col(quote(columns.unit)).alias(UNIT), flight.alias(FLIGHT), day.alias(DAY)]
-    first_day = F.min(DAY)
+    order = F.col(quote(columns.time)) if is_timestamp(df, columns.time) else day
+    selects = [F.col(quote(columns.unit)).alias(UNIT), flight.alias(FLIGHT), day.alias(DAY), order.alias(ORDER)]
     if exposure:
         exposure_day = day_column(df, exposure, columns.time_format)
         if is_timestamp(df, columns.time) and is_timestamp(df, exposure):
@@ -156,17 +161,49 @@ def prepare_prejoined(
             after = day >= exposure_day
         keep = keep & (F.col(quote(exposure)).isNull() | after)
         selects.append(exposure_day.alias(EXPOSURE_DAY))
-        first_day = F.coalesce(F.min(EXPOSURE_DAY), F.min(DAY))
-    selects += [_segment(c) for c in (*user_cols, *metric_segment_cols)]
+    selects += [F.col(quote(c)).cast("string").alias(c) for c in user_cols]
+    selects += [_segment(c) for c in metric_segment_cols]
     selects += [F.col(quote(c)).alias(c) for c in inputs]
-    rows = df.where(keep).select(*selects)
+    return df.where(keep).select(*selects)
+
+
+def _earliest_value(col: str) -> Column:
+    """A unit's value of ``col`` on its earliest row, as one aggregate (no sort, no window).
+
+    Ties at the same time go to the smallest value, so the result is deterministic. NULLs are skipped,
+    and the unit lands in the ``(null)`` segment only when every row is NULL.
+    """
+    value = F.col(quote(col))
+    first = F.min(F.when(value.isNotNull(), F.struct(F.col(ORDER).alias("t"), value.alias("v"))))
+    return F.coalesce(first.getField("v"), F.lit(NULL_LABEL)).alias(col)
+
+
+def prepare_prejoined(
+    df: DataFrame,
+    columns: Columns,
+    period: Period,
+    flights: Sequence[str],
+    user_cols: Sequence[str],
+    metric_segment_cols: Sequence[str],
+    inputs: Sequence[str],
+    where: str,
+) -> Prepared:
+    """Rows and population of a table that already carries flight and user segments on every row.
+
+    Every unit gets exactly one value per user segment column, taken from its earliest row (the value
+    closest to exposure). Rows then carry that value, so a breakdown never splits a unit and adding one
+    never changes the overall results.
+    """
+    raw = prejoined_rows(df, columns, period, flights, user_cols, metric_segment_cols, inputs, where)
+    first_day = F.coalesce(F.min(EXPOSURE_DAY), F.min(DAY)) if columns.exposure else F.min(DAY)
     population = (
-        rows.groupBy(*_cols((UNIT, FLIGHT, *user_cols)))
-        .agg(first_day.alias(FIRST_DAY))
+        raw.groupBy(UNIT, FLIGHT)
+        .agg(first_day.alias(FIRST_DAY), *[_earliest_value(c) for c in user_cols])
         .withColumn(FIRST_DAY, F.greatest(F.col(FIRST_DAY), F.lit(period.start)))
     )
-    if exposure:
-        rows = rows.drop(EXPOSURE_DAY)
+    rows = raw.drop(ORDER, *([EXPOSURE_DAY] if columns.exposure else []), *user_cols)
+    if user_cols:
+        rows = rows.join(population.select(*_cols((UNIT, FLIGHT, *user_cols))), on=[UNIT, FLIGHT], how="inner")
     return Prepared(rows, population)
 
 

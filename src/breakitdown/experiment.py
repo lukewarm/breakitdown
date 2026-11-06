@@ -62,7 +62,8 @@ class Experiment:
         Inclusive date range of the analysis, as dates or ``YYYY-MM-DD`` / ``YYYYMMDD`` strings.
     user_segments:
         Breakdowns of units, e.g. ``["os", ("os", "country")]`` or ``"os|country"``. A unit is in
-        exactly one value of each segment, and segment columns must be constant per unit.
+        exactly one value of each segment. When a pre-joined unit's rows disagree, the value on its
+        earliest row is used, so adding a breakdown never changes the overall results.
     mapping:
         Optional ``FlightMapping``; switches every table to mapping mode.
     columns:
@@ -334,15 +335,18 @@ class Experiment:
         """Data checks for one MetricTable, as a small table of (check, value, ok).
 
         Pre-joined mode checks the table: units in the date range, units seen in more than one
-        flight, units whose user segment values change between rows, and flights with no units.
-        Mapping mode runs the same checks on the mapping and counts metric rows whose unit is not
-        mapped.
+        flight, units whose user segment values change between rows (the analysis uses the value on
+        their earliest row), and flights with no units. Mapping mode runs the same checks on the
+        mapping and counts metric rows whose unit is not mapped.
         """
         spark = self._session([table])
         user_cols = segment_columns(self.user_segments)
         checks: List[Tuple[str, Any, Optional[bool]]] = []
         if self.mapping is None:
-            rows = self._prepare(table, spark, None).rows
+            rows = aggregate.prejoined_rows(
+                load_source(table.source, spark), table.columns or self.columns, self.period, self.flights,
+                user_cols, table.metric_segment_columns, table.input_columns, f"MetricTable {table.name!r}",
+            )
             checks.append(("rows in date range", rows.count(), None))
         else:
             mapping_columns = self.mapping.columns or self.columns

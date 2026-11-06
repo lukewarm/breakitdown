@@ -279,8 +279,10 @@ Set the columns once on the `Experiment`. A table with a different schema passes
 * **Segment syntax:** both kinds of segment accept `"os"`, `("os", "country")`, `"os|country"`, or
   a list of these. Multi-column values read like `ios|US`.
 * **NULL values:** these form their own `(null)` segment.
-* **User segments:** columns must be constant per unit; `exp.validate(table)` reports units where
-  they change.
+* **User segments:** each unit gets exactly one value per column. In a pre-joined table whose rows
+  disagree for a unit, the value on the unit's earliest row is used. Ties go to the smallest value, and
+  NULL counts only if every row is NULL. A breakdown therefore never changes the overall results.
+  `exp.validate(table)` counts the units whose values change.
 
 ## Roadmap
 

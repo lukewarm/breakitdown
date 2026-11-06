@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.1 (2026-11-06)
+
+Fixed: in pre-joined tables, a user whose segment value changed between rows (say, `os` recorded per
+event for someone with two devices) was split into one unit per value. That also changed the overall
+results, not just the breakdown.
+
+- Every user now gets exactly one value per user segment column: the value on their earliest row, the
+  one closest to exposure.
+- Ties at the same time go to the smallest value. NULLs are skipped unless every row is NULL.
+- Adding a breakdown never changes the overall numbers, and segment sizes add up to the overall size.
+- `Experiment.validate()` still counts users whose values change.
+
 ## 0.1.0 (2026-11-06)
 
 First release.
