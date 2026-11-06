@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# Spark local runs
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

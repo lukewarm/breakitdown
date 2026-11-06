@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "breakitdown"
+dynamic = ["version"]
+description = "A/B test analysis on Spark, broken down by any user or metric segment."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+authors = [{ name = "Max He" }]
+keywords = ["a/b testing", "experimentation", "spark", "pyspark", "statistics", "delta method"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Typing :: Typed",
+]
+# pyspark is optional on purpose: Spark clusters (Databricks, EMR, Dataproc, ...) ship their own,
+# and installing a second copy from PyPI can shadow it. Use the `spark` extra everywhere else.
+dependencies = [
+    "numpy>=1.22",
+    "pandas>=1.4",
+    "scipy>=1.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/lukewarm/breakitdown"
+Issues = "https://github.com/lukewarm/breakitdown/issues"
+Changelog = "https://github.com/lukewarm/breakitdown/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+spark = ["pyspark>=3.3"]
+test = ["pyspark>=3.3", "pytest>=7", "pytest-timeout>=2", "scipy>=1.11"]
+
+[tool.hatch.version]
+path = "src/breakitdown/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/breakitdown"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/breakitdown", "tests", "README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+timeout = 600

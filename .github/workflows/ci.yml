@@ -1,0 +1,33 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:  # the release workflow runs the tests before publishing
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.9"
+            pyspark: "pyspark>=3.3,<4"
+          - python: "3.12"
+            pyspark: "pyspark>=3.5,<4"
+          - python: "3.12"
+            pyspark: "pyspark>=4,<5"
+    name: python ${{ matrix.python }}, ${{ matrix.pyspark }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e ".[test]" "${{ matrix.pyspark }}"
+      - run: python -m pytest
