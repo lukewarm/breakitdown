@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The package metadata links to the author's homepage, https://maxhe.org/.
+
 ## 0.1.1 (2026-11-06)
 
 Fixed: in pre-joined tables, a user whose segment value changed between rows (say, `os` recorded per

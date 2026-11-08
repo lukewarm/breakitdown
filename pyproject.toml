@@ -33,6 +33,7 @@ dependencies = [
 Homepage = "https://github.com/lukewarm/breakitdown"
 Issues = "https://github.com/lukewarm/breakitdown/issues"
 Changelog = "https://github.com/lukewarm/breakitdown/blob/main/CHANGELOG.md"
+Author = "https://maxhe.org/"
 
 [project.optional-dependencies]
 spark = ["pyspark>=3.3"]
