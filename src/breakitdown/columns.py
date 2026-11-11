@@ -22,8 +22,8 @@ class Columns:
         flight its unit is in, as in one table shared by many experiments: a string of flights (set
         ``flight_separator``) or an array (read as a list on its own). Each experiment then reads the
         rows that list one of its own flights and skips the rest, so flight names must be unique
-        across experiments. A row that lists two of an experiment's flights counts in both, and
-        ``validate()`` reports it.
+        across experiments. A unit on a row that lists two of an experiment's flights is in both,
+        and is left out like any unit in two flights (see ``Experiment``).
     time:
         Event time of a row: DATE, TIMESTAMP, string (parsed with ``time_format``, default ISO
         ``yyyy-MM-dd``) or ``yyyyMMdd`` integers. Rows are bucketed by the calendar day of this

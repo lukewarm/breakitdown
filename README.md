@@ -114,6 +114,25 @@ results = exp.analyze([events, latency])
 * Quantiles pool all rows of a flight, with users as clusters. `method="density"` suits
   integer-valued metrics; see [Methods](#methods).
 
+### Thresholds and per-user ratios
+
+```python
+from breakitdown import MeanRatio
+
+engagement = MetricTable("analytics.app_events", [
+    Binary("sessions", name="returning_users", min_sum=2),                # users with 2+ sessions
+    MeanRatio("clicks", "sessions", name="clicks_per_session_per_user"),  # each user's own ratio, averaged
+], name="engagement")
+results = exp.analyze([events, engagement])
+```
+
+* `Binary(col, min_sum=k)` counts a user whose `col` adds up to at least k, instead of any positive
+  value. With a 0/1 column on a user × day table, `min_sum=2` is the share of users active on two or
+  more days.
+* `MeanRatio(numerator, denominator)` averages each user's own ratio, over the users whose
+  denominator isn't zero, and tests it with Welch's t-test. `Ratio` divides the totals instead, so
+  heavy users weigh more.
+
 ### One table for many experiments
 
 Many teams log one table for all their experiments and tag every row with each flight its user is in,
@@ -157,6 +176,19 @@ results = exp.analyze(purchases)
 `analytics.purchases` needs only `ruid`, `event_time` and `revenue`. Every mapped user counts:
 mapped users with no purchases count as zero revenue. Rows before a user's `exposure_time` are dropped.
 
+The mapping is read up to `end`: users exposed later are dropped before any grouping, with a filter
+Spark can push down to the source. Everyone exposed earlier stays in, even before `start`, so a window
+that starts late still covers the whole experiment. To read the mapping your own way, give it a SQL
+query, say to keep only users exposed since the window began:
+
+```python
+recent = Experiment("control", ["t1", "t2"], "2024-03-08", "2024-03-14", mapping=FlightMapping(
+    "SELECT * FROM analytics.flight_assignment WHERE exposure_time >= '2024-03-08'",
+    Columns(exposure="exposure_time"),
+))
+recent.analyze(purchases).overall()
+```
+
 ### Other column names and date formats
 
 ```python
@@ -186,7 +218,7 @@ filters the time column itself, and Spark prunes partitions on it.
 
 ```text
 Experiment(control, treatments, start, end, *, user_segments=None, mapping=None, columns=None,
-           expected_traffic=None, spark=None)
+           expected_traffic=None, exclude_multi_flight_units=True, spark=None)
     .analyze(metric_tables, *, daily=True, alpha=0.05, enforce_min_sample=True,
              hte_alpha=0.001, hte_min_units=10_000, hte_scale="absolute", cache=True) -> ExperimentResults
     .validate(metric_table) -> pandas.DataFrame
@@ -196,8 +228,9 @@ FlightMapping(source, columns=None)
 Columns(unit="ruid", flight="flight", time="event_time", exposure=None, time_format=None, flight_separator=None)
 
 Count(col, name="", label="", direction="up")
-Binary(col, name="", label="", direction="up")
+Binary(col, name="", label="", direction="up", min_sum=None)
 Ratio(numerator, denominator, name="", label="", direction="up")     # numerator/denominator: column, Count or Binary
+MeanRatio(numerator, denominator, name="", label="", direction="up") # the same inputs; mean of per-unit ratios
 Quantile(col, quantiles=(0.5, 0.9), method="regular", bandwidth=0.001, lower=None, upper=None,
          resolution=1.0, accuracy=10_000, name="", label="", direction="up")
 ```
@@ -221,13 +254,15 @@ or `"daily"`.
 
 The randomization unit (`ruid`) is the independent observation. Each metric is first reduced to one
 value per unit: its total over the date range for cumulative results, and over the day for daily
-results. Units in the population without rows contribute zeros. Sample variances divide by n − 1.
+results. Units in the population without rows contribute zeros, except in MeanRatio, which has a
+ratio only for units whose denominator isn't zero. Sample variances divide by n − 1.
 
 | Metric | Estimate per flight | Variance V of the estimate | Test and CI quantile c |
 |--------|---------------------|----------------------------|------------------------|
 | `Count(y)` | ȳ = Σ y_u / n | s²_y / n | Welch t; c = t(1 − α/2, ν) |
-| `Binary(y)` | p̂ = #{u : y_u > 0} / n | p̂ (1 − p̂) / (n − 1) | Welch t; c = t(1 − α/2, ν) |
+| `Binary(y)` | p̂ = #{u : y_u > 0} / n; with `min_sum=k`, #{u : y_u ≥ k} / n | p̂ (1 − p̂) / (n − 1) | Welch t; c = t(1 − α/2, ν) |
 | `Ratio(y, x)` | R = Σ y_u / Σ x_u | (s²_y − 2R s_xy + R² s²_x) / (n x̄²), the delta method | z; c = z(1 − α/2) |
+| `MeanRatio(y, x)` | r̄ = Σ r_u / n_x, with r_u = y_u / x_u over the n_x units with x_u ≠ 0 | s²_r / n_x | Welch t; c = t(1 − α/2, ν) |
 | `Quantile(v, p)` | Q = p-quantile of v over all rows | Σ_u (a_u − r m_u)² / (Σ_u m_u)² / f̂(Q)² | z; c = z(1 − α/2) |
 
 For treatment T and control C, with estimates θ and variances V:
@@ -251,6 +286,7 @@ For treatment T and control C, with estimates θ and variances V:
   * Count: n ≥ 200.
   * Binary: at least 10 units with a hit and 10 without.
   * Ratio: n ≥ 100.
+  * MeanRatio: n_x ≥ 200.
   * Quantile: n ≥ 1,000 and at least 2,000 rows.
 
   Below these, `sufficient_sample` is False, and the CIs and p-value are left empty unless you pass
@@ -298,8 +334,11 @@ Set the columns once on the `Experiment`. A table with a different schema passes
 * **Exposure cut-off:** exact when both `time` and `exposure` are timestamps, by day otherwise.
 * **Several mapping rows per unit:** reduced to one row per unit and flight, keeping the earliest
   exposure and the largest non-null segment value.
-* **Unit in two flights:** counted in both, as is a row that lists two of the experiment's flights.
-  `exp.validate(table)` reports it.
+* **Unit in two flights** (in both control and treatment logs, say, or on a row that lists both): left
+  out of the population and the rows. `Experiment(exclude_multi_flight_units=False)` counts it in
+  each flight instead. `exp.validate(table)` reports how many there are.
+* **Mapping dates:** rows exposed after `end` are dropped before grouping. Everyone exposed earlier
+  stays in, even before `start`. To read the mapping another way, make its source a SQL query.
 
 ### Grain and segments
 

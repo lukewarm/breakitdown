@@ -5,7 +5,8 @@ import datetime as dt
 import pandas as pd
 import pytest
 
-from breakitdown import Binary, Columns, Count, Direction, Experiment, FlightMapping, MetricTable, Quantile, QuantileMethod, Ratio
+from breakitdown import (Binary, Columns, Count, Direction, Experiment, FlightMapping, MeanRatio, MetricTable, Quantile,
+                         QuantileMethod, Ratio)
 from breakitdown._common import normalize_segments, to_date
 from breakitdown.compare import compare_table
 
@@ -41,6 +42,11 @@ def test_metric_defaults_and_validation():
         Quantile("x", [0.5, 50])
     with pytest.raises(TypeError):
         Ratio("clicks", Quantile("x"))
+    mean_ratio = MeanRatio("clicks", "sessions")
+    assert mean_ratio.name == "mean_clicks_per_sessions" and mean_ratio.input_columns == ("clicks", "sessions")
+    assert Binary("active", min_sum=2).min_sum == 2 and Binary("active").min_sum is None
+    with pytest.raises(ValueError):
+        Binary("active", min_sum=0)  # units without rows would never count, unlike units with a total of 0
 
 
 def test_metric_table_validation():

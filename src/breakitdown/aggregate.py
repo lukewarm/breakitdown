@@ -18,6 +18,7 @@ the metric rows to the mapping and takes the population from the mapping.
 
 from __future__ import annotations
 
+import datetime as dt
 import functools
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -219,12 +220,14 @@ def prepare_prejoined(
     metric_segment_cols: Sequence[str],
     inputs: Sequence[str],
     where: str,
+    exclude_multi_flight_units: bool = True,
 ) -> Prepared:
     """Rows and population of a table that already carries flight and user segments on every row.
 
     Every unit gets exactly one value per user segment column, taken from its earliest row (the value
     closest to exposure). Rows then carry that value, so a breakdown never splits a unit and adding one
-    never changes the overall results.
+    never changes the overall results. Units seen in more than one flight are left out unless
+    ``exclude_multi_flight_units`` is False, in which case they count in each.
     """
     raw = prejoined_rows(df, columns, period, flights, user_cols, metric_segment_cols, inputs, where)
     first_day = F.coalesce(F.min(EXPOSURE_DAY), F.min(DAY)) if columns.exposure else F.min(DAY)
@@ -233,24 +236,64 @@ def prepare_prejoined(
         .agg(first_day.alias(FIRST_DAY), *[_earliest_value(c) for c in user_cols])
         .withColumn(FIRST_DAY, F.greatest(F.col(FIRST_DAY), F.lit(period.start)))
     )
+    if exclude_multi_flight_units:
+        population = single_flight_units(population)
     rows = raw.drop(ORDER, *([EXPOSURE_DAY] if columns.exposure else []), *user_cols)
     if user_cols:
         rows = rows.join(population.select(*_cols((UNIT, FLIGHT, *user_cols))), on=[UNIT, FLIGHT], how="inner")
+    elif exclude_multi_flight_units:
+        rows = rows.join(population.select(UNIT, FLIGHT), on=[UNIT, FLIGHT], how="left_semi")
     return Prepared(rows, population)
 
 
-def mapping_rows(df: DataFrame, columns: Columns, flights: Sequence[str], user_cols: Sequence[str], where: str) -> DataFrame:
-    """The mapping's rows for the experiment's flights, with internal column names."""
+def single_flight_units(population: DataFrame) -> DataFrame:
+    """The population (one row per unit and flight) without units seen in more than one flight."""
+    flights_per_unit = F.count(F.lit(1)).over(Window.partitionBy(UNIT))
+    return population.withColumn("__flights", flights_per_unit).where(F.col("__flights") == 1).drop("__flights")
+
+
+def _on_or_before(df: DataFrame, name: str, time_format: Optional[str], day: dt.date) -> Column:
+    """``name``'s calendar day is ``day`` or earlier, as a plain comparison on the column when it is a
+    DATE, a TIMESTAMP or a yyyyMMdd integer, so a source can use it to skip files and row groups."""
+    dtype = _field_type(df, name)
+    col = F.col(quote(name))
+    if isinstance(dtype, T.DateType):
+        return col <= F.lit(day)
+    if isinstance(dtype, _TIMESTAMP_TYPES):
+        # The next midnight in the session time zone, the zone day_column buckets days in.
+        return col < F.lit(f"{day + dt.timedelta(days=1)} 00:00:00").cast(dtype)
+    if isinstance(dtype, _INTEGRAL_TYPES) and (time_format or "yyyyMMdd") == "yyyyMMdd":
+        return col <= F.lit(int(day.strftime("%Y%m%d")))
+    return day_column(df, name, time_format) <= F.lit(day)
+
+
+def mapping_rows(
+    df: DataFrame,
+    columns: Columns,
+    period: Optional[Period],
+    flights: Sequence[str],
+    user_cols: Sequence[str],
+    where: str,
+) -> DataFrame:
+    """The mapping's rows for the experiment's flights, with internal column names.
+
+    With a ``period``, rows exposed after its end date are dropped here, before any grouping, with a
+    filter the source can push down. Earlier exposures all stay: a unit exposed before the start date
+    is still in. ``validate()`` passes no period, to check the whole mapping.
+    """
     exposure = columns.exposure
     require_columns(df, [columns.unit, columns.flight, *([exposure] if exposure else []), *user_cols], where)
     in_experiment, flight = experiment_flight(df, columns, flights)
+    keep = in_experiment & F.col(quote(columns.unit)).isNotNull()
     selects = [F.col(quote(columns.unit)).alias(UNIT), flight.alias(FLIGHT)]
     selects += [F.col(quote(c)).cast("string").alias(c) for c in user_cols]
     if exposure:
+        if period is not None:
+            keep = keep & (F.col(quote(exposure)).isNull() | _on_or_before(df, exposure, columns.time_format, period.end))
         selects.append(day_column(df, exposure, columns.time_format).alias(EXPOSURE_DAY))
         if is_timestamp(df, exposure):
             selects.append(F.col(quote(exposure)).alias(EXPOSURE_TS))
-    return df.where(in_experiment & F.col(quote(columns.unit)).isNotNull()).select(*selects)
+    return df.where(keep).select(*selects)
 
 
 def prepare_mapping(
@@ -260,9 +303,10 @@ def prepare_mapping(
     flights: Sequence[str],
     user_cols: Sequence[str],
     where: str,
+    exclude_multi_flight_units: bool = True,
 ) -> Tuple[DataFrame, bool]:
     """Population from a flight mapping. Returns (population, has exact exposure timestamps)."""
-    rows = mapping_rows(df, columns, flights, user_cols, where)
+    rows = mapping_rows(df, columns, period, flights, user_cols, where)
     has_day = EXPOSURE_DAY in rows.columns
     precise = EXPOSURE_TS in rows.columns
     aggs = [F.max(F.col(quote(c))).alias(c) for c in user_cols]
@@ -270,7 +314,8 @@ def prepare_mapping(
     if precise:
         aggs.append(F.min(EXPOSURE_TS).alias(EXPOSURE_TS))
     population = rows.groupBy(UNIT, FLIGHT).agg(*aggs)
-    population = population.where(F.col(FIRST_DAY).isNull() | (F.col(FIRST_DAY) <= F.lit(period.end)))
+    if exclude_multi_flight_units:
+        population = single_flight_units(population)
     population = population.withColumn(
         FIRST_DAY, F.greatest(F.coalesce(F.col(FIRST_DAY), F.lit(period.start)), F.lit(period.start))
     )

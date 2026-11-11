@@ -13,11 +13,11 @@ See README.md for the design, the input contract and the result columns.
 from ._common import NULL_LABEL, OVERALL
 from .columns import Columns
 from .experiment import Experiment
-from .metrics import Binary, Count, Direction, Metric, Quantile, QuantileMethod, Ratio
+from .metrics import Binary, Count, Direction, MeanRatio, Metric, Quantile, QuantileMethod, Ratio
 from .results import ExperimentResults
 from .tables import FlightMapping, MetricTable
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Experiment",
@@ -27,6 +27,7 @@ __all__ = [
     "Count",
     "Binary",
     "Ratio",
+    "MeanRatio",
     "Quantile",
     "Metric",
     "Direction",

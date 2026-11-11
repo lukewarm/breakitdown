@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from breakitdown import Binary, Count, Experiment, MetricTable, Quantile, Ratio, stats
+from breakitdown import Binary, Count, Experiment, MeanRatio, MetricTable, Quantile, Ratio, stats
 from . import reference as ref
 from .reference import check, row
 
@@ -37,6 +37,8 @@ def results(events):
             Count("clicks"),
             Binary("clicks", name="clickers"),
             Ratio("clicks", "session_start", name="clicks_per_session"),
+            Binary("clicks", name="clicks_3plus", min_sum=3),
+            MeanRatio("session_start", "clicks", name="mean_sessions_per_click"),  # 71 units have no clicks
             Quantile("latency_ms", [0.5, 0.9], method="density", name="latency", direction="down"),
         ],
         name="events",
@@ -55,6 +57,21 @@ def test_overall_count_binary_ratio(results, events, population, treatment):
     check(row(overall, metric="clickers", treatment=treatment), ref.welch(clickers, treatment))
     sessions = ref.unit_values(pdf, population, "session_start")
     check(row(overall, metric="clicks_per_session", treatment=treatment), ref.ratio(clicks, sessions, treatment))
+
+
+@pytest.mark.parametrize("treatment", ["t1", "t2"])
+def test_overall_binary_threshold_and_mean_ratio(results, events, population, treatment):
+    _, pdf = events
+    overall = results.overall()
+    clicks = ref.unit_values(pdf, population, "clicks")
+    three_plus = clicks.assign(v=(clicks["v"] >= 3).astype(float))
+    check(row(overall, metric="clicks_3plus", treatment=treatment), ref.welch(three_plus, treatment))
+    sessions = ref.unit_values(pdf, population, "session_start")
+    both = sessions.merge(clicks, on=["ruid", "flight"], suffixes=("_n", "_d"))
+    with_clicks = both[both["v_d"] != 0]  # a unit's ratio exists only with a non-zero denominator
+    assert len(with_clicks) < len(both)  # so the metric has its own unit count
+    ratios = with_clicks.assign(v=with_clicks["v_n"] / with_clicks["v_d"])
+    check(row(overall, metric="mean_sessions_per_click", treatment=treatment), ref.welch(ratios, treatment))
 
 
 @pytest.mark.parametrize("p", [0.5, 0.9])
@@ -129,7 +146,7 @@ def test_srm_bh_and_sample_size_flags(results):
     by_os = row(results.by_user_segment("os"), metric="clicks", os="ios", treatment="t2")
     assert ios.p_value == pytest.approx(by_os.srm_p_value)
     family = overall[overall["treatment"] == "t1"]
-    assert len(family) == 5  # 3 unit metrics + 2 quantiles
+    assert len(family) == 7  # 5 unit metrics + 2 quantiles
     np.testing.assert_allclose(family["p_value_bh"], stats.bh_adjust(family["p_value"]))
     null_os = row(results.by_user_segment("os"), metric="clicks", os="(null)", treatment="t1")
     assert not null_os.sufficient_sample and not np.isnan(null_os.p_value)  # flagged, not blanked here

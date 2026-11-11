@@ -117,7 +117,9 @@ class FlightMapping:
     as zeros. Expected columns: ``columns.unit``, ``columns.flight``, optionally
     ``columns.exposure``, and the experiment's user segment columns. Several rows per unit are fine:
     they are reduced to one row per unit and flight, with the earliest exposure and the largest
-    non-null value of each segment column. Units exposed after the end date are left out.
+    non-null value of each segment column. Rows exposed after the end date are dropped before that,
+    with a filter Spark can push down; units exposed before the start date stay in. To read the
+    mapping another way, make ``source`` a SQL query.
     """
 
     source: Source

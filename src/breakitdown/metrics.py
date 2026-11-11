@@ -7,13 +7,17 @@ difference between two flights.
 Kind        Value per flight                                 Test
 ==========  ===============================================  =================================
 Count       mean over units of each unit's total             Welch t-test
-Binary      share of units with any positive value           Welch t-test on the 0/1 indicator
+Binary      share of units with any positive value (or a     Welch t-test on the 0/1 indicator
+            total of at least ``min_sum``)
 Ratio       sum(numerator) / sum(denominator) over units     delta method, z-test
+MeanRatio   mean over units of numerator / denominator       Welch t-test on the unit ratios
 Quantile    p-th quantile of the row values (events)         unit-clustered asymptotic z-test
 ==========  ===============================================  =================================
 
 Units without rows count as zero for Count, Binary and Ratio, so the denominator of a mean is
-always the flight's population, never just the units that happened to have rows.
+always the flight's population, never just the units that happened to have rows. MeanRatio is the
+exception: a unit's ratio exists only when its denominator is not zero, so it averages over those
+units and reports them as its own unit count.
 
 Each kind owns everything specific to it, which keeps adding a kind (or capping, or a
 variance-reduction method) a local change:
@@ -43,7 +47,7 @@ from ._common import quote
 StatGetter = Callable[..., np.ndarray]
 """``stat(name, fill=0.0)`` returns one sufficient statistic as a float array; NaN -> ``fill``."""
 
-__all__ = ["Direction", "QuantileMethod", "Metric", "UnitMetric", "Count", "Binary", "Ratio", "Quantile"]
+__all__ = ["Direction", "QuantileMethod", "Metric", "UnitMetric", "Count", "Binary", "Ratio", "MeanRatio", "Quantile"]
 
 
 class Direction(str, enum.Enum):
@@ -166,25 +170,35 @@ class Count(UnitMetric):
 
 @dataclass(frozen=True)
 class Binary(UnitMetric):
-    """Share of units with any positive ``col`` value, e.g. the share of users who clicked."""
+    """Share of units with any positive ``col`` value, e.g. the share of users who clicked.
+
+    With ``min_sum``, a unit counts when its total ``col`` is at least ``min_sum`` instead: on a
+    user x day table with a 0/1 ``active`` column, ``Binary("active", min_sum=2)`` is the share of
+    users active on two or more days.
+    """
 
     col: str
     name: str = ""
     label: str = ""
     direction: Union[Direction, str] = Direction.UP
+    min_sum: Optional[float] = None
 
     kind: ClassVar[str] = "binary"
     min_events: ClassVar[int] = 10
 
     def __post_init__(self) -> None:
         _setup(self, self.col)
+        if self.min_sum is not None and not float(self.min_sum) > 0:
+            raise ValueError("min_sum must be positive: units without rows never count.")
 
     @property
     def input_columns(self) -> Tuple[str, ...]:
         return (self.col,)
 
     def unit_aggregations(self, key: str) -> Dict[str, Column]:
-        return {key: F.max(F.when(_number(self.col) > 0, F.lit(1.0)).otherwise(F.lit(0.0)))}
+        if self.min_sum is None:
+            return {key: F.max(F.when(_number(self.col) > 0, F.lit(1.0)).otherwise(F.lit(0.0)))}
+        return {key: F.when(F.sum(_number(self.col)) >= float(self.min_sum), F.lit(1.0)).otherwise(F.lit(0.0))}
 
     def group_aggregations(self, key: str) -> Dict[str, Column]:
         return {f"{key}__hits": F.sum(F.coalesce(F.col(key), F.lit(0.0)))}
@@ -259,6 +273,55 @@ class Ratio(UnitMetric):
 
     def estimate(self, stat: StatGetter, n: np.ndarray) -> stats.Estimate:
         return stats.ratio_estimate(n, stat("num"), stat("num2"), stat("den"), stat("den2"), stat("numden"))
+
+    def has_min_sample(self, control: stats.Estimate, treatment: stats.Estimate) -> np.ndarray:
+        return (control.n >= self.min_units) & (treatment.n >= self.min_units)
+
+
+@dataclass(frozen=True)
+class MeanRatio(UnitMetric):
+    """Mean over units of each unit's ``numerator / denominator``, e.g. each user's clicks per session,
+    averaged over users.
+
+    ``numerator`` and ``denominator`` are summed per unit, as in ``Ratio``. Only units whose
+    denominator is not zero have a ratio, so the mean, its Welch t-test and the reported unit count
+    cover those units. ``Ratio`` divides the totals instead, which weighs units by their denominator.
+    """
+
+    numerator: Union[str, Count, Binary]
+    denominator: Union[str, Count, Binary]
+    name: str = ""
+    label: str = ""
+    direction: Union[Direction, str] = Direction.UP
+
+    kind: ClassVar[str] = "mean_ratio"
+    min_units: ClassVar[int] = 200
+
+    def __post_init__(self) -> None:
+        numerator = _component(self.numerator, "numerator")
+        denominator = _component(self.denominator, "denominator")
+        object.__setattr__(self, "numerator", numerator)
+        object.__setattr__(self, "denominator", denominator)
+        _setup(self, f"mean_{numerator.col}_per_{denominator.col}")
+
+    @property
+    def input_columns(self) -> Tuple[str, ...]:
+        return tuple(dict.fromkeys(self.numerator.input_columns + self.denominator.input_columns))
+
+    def unit_aggregations(self, key: str) -> Dict[str, Column]:
+        return {
+            **self.numerator.unit_aggregations(f"{key}__n"),
+            **self.denominator.unit_aggregations(f"{key}__d"),
+        }
+
+    def group_aggregations(self, key: str) -> Dict[str, Column]:
+        num = F.coalesce(F.col(f"{key}__n"), F.lit(0.0))
+        den = F.coalesce(F.col(f"{key}__d"), F.lit(0.0))
+        ratio = F.when(den != 0, num / den)  # NULL without a denominator: left out of all three sums
+        return {f"{key}__units": F.count(ratio), f"{key}__sum": F.sum(ratio), f"{key}__sumsq": F.sum(ratio * ratio)}
+
+    def estimate(self, stat: StatGetter, n: np.ndarray) -> stats.Estimate:
+        return stats.mean_estimate(stat("units"), stat("sum"), stat("sumsq"))
 
     def has_min_sample(self, control: stats.Estimate, treatment: stats.Estimate) -> np.ndarray:
         return (control.n >= self.min_units) & (treatment.n >= self.min_units)

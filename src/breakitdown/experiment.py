@@ -70,6 +70,10 @@ class Experiment:
         Column names shared by all tables (``Columns()`` defaults: ruid, flight, event_time).
     expected_traffic:
         Optional ``{flight: share}`` for sample-ratio-mismatch tests, e.g. ``{"control": 1, "t1": 1}``.
+    exclude_multi_flight_units:
+        Leave out units seen in more than one of the experiment's flights, say in both control and
+        treatment logs (the default). With False they count in each flight. ``validate()`` reports
+        how many there are either way.
     spark:
         SparkSession; defaults to the one of a DataFrame source, else the active session.
     """
@@ -85,6 +89,7 @@ class Experiment:
         mapping: Optional[FlightMapping] = None,
         columns: Optional[Columns] = None,
         expected_traffic: Optional[Mapping[str, float]] = None,
+        exclude_multi_flight_units: bool = True,
         spark: Optional[SparkSession] = None,
     ):
         self.control = str(control)
@@ -109,6 +114,7 @@ class Experiment:
             if any(traffic[f] <= 0 for f in self.flights):
                 raise ValueError("expected_traffic shares must be positive.")
             self.expected_traffic = {f: traffic[f] for f in self.flights}
+        self.exclude_multi_flight_units = bool(exclude_multi_flight_units)
         self._spark = spark
 
     @property
@@ -279,7 +285,7 @@ class Experiment:
         if mapping_population is None:
             return aggregate.prepare_prejoined(
                 df, columns, self.period, self.flights, user_cols, table.metric_segment_columns,
-                table.input_columns, where,
+                table.input_columns, where, self.exclude_multi_flight_units,
             )
         population, has_timestamps = mapping_population
         return aggregate.prepare_joined(
@@ -292,7 +298,7 @@ class Experiment:
         df = load_source(self.mapping.source, spark)
         return aggregate.prepare_mapping(
             df, self.mapping.columns or self.columns, self.period, self.flights,
-            segment_columns(self.user_segments), "FlightMapping",
+            segment_columns(self.user_segments), "FlightMapping", self.exclude_multi_flight_units,
         )
 
     def _check_tables(self, metric_tables: MetricTables) -> List[MetricTable]:
@@ -335,9 +341,10 @@ class Experiment:
         """Data checks for one MetricTable, as a small table of (check, value, ok).
 
         Pre-joined mode checks the table: units in the date range, units seen in more than one
-        flight, units whose user segment values change between rows (the analysis uses the value on
-        their earliest row), and flights with no units. Mapping mode runs the same checks on the
-        mapping and counts metric rows whose unit is not mapped.
+        flight (left out of the analysis unless ``exclude_multi_flight_units`` is False), units whose
+        user segment values change between rows (the analysis uses the value on their earliest row),
+        and flights with no units. Mapping mode runs the same checks on the mapping and counts metric
+        rows whose unit is not mapped.
         """
         spark = self._session([table])
         user_cols = segment_columns(self.user_segments)
@@ -351,7 +358,7 @@ class Experiment:
         else:
             mapping_columns = self.mapping.columns or self.columns
             rows = aggregate.mapping_rows(
-                load_source(self.mapping.source, spark), mapping_columns, self.flights, user_cols, "FlightMapping"
+                load_source(self.mapping.source, spark), mapping_columns, None, self.flights, user_cols, "FlightMapping"
             )
             columns = table.columns or self.columns
             metric_df = load_source(table.source, spark)
@@ -375,7 +382,8 @@ class Experiment:
         units = int(summary["units"] or 0)
         multi = int(summary["multi"] or 0)
         checks.append(("units", units, units > 0))
-        checks.append(("units in more than one flight", multi, multi == 0))
+        # Left out of the analysis by default, so then just for information; counted twice, a problem.
+        checks.append(("units in more than one flight", multi, None if self.exclude_multi_flight_units else multi == 0))
         for i, col in enumerate(user_cols):
             inconsistent = int(summary[f"s{i}"] or 0)
             checks.append((f"units with more than one {col!r} value", inconsistent, inconsistent == 0))
