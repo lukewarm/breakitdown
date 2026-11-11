@@ -17,7 +17,7 @@ from .metrics import Binary, Count, Direction, Metric, Quantile, QuantileMethod,
 from .results import ExperimentResults
 from .tables import FlightMapping, MetricTable
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 __all__ = [
     "Experiment",

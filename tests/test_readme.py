@@ -21,7 +21,11 @@ def readme_python_blocks():
 
 
 def build_readme_tables(spark, users=3000, seed=0):
-    """The ``analytics.*`` tables the README examples read. t1 lifts photo clicks by 20%; t2 cuts latency."""
+    """The ``analytics.*`` tables the README examples read. t1 lifts photo clicks by 20%; t2 cuts latency.
+
+    ``shared_events`` tags every row with two experiments' flights (search and feed), comma-separated;
+    search_t1 lifts clicks by 20%.
+    """
     rng = np.random.default_rng(seed)
     app_events, latency, purchases, assignment, daily_stats = [], [], [], [], []
     for u in range(users):
@@ -51,6 +55,13 @@ def build_readme_tables(spark, users=3000, seed=0):
             if rng.random() < 0.08:
                 purchases.append((ruid, midnight + dt.timedelta(hours=20), round(float(rng.exponential(20.0)), 2)))
 
+    shared, shared_rng = [], np.random.default_rng(seed + 1)  # its own stream, so the tables above don't change
+    for u in range(users):
+        search, feed = str(shared_rng.choice(["search_c", "search_t1"])), str(shared_rng.choice(["feed_c", "feed_t1"]))
+        for d in range(DAYS):
+            clicks = int(shared_rng.poisson(1.2 if search == "search_t1" else 1.0))
+            shared.append((f"u{u}", f"{search},{feed}", START + dt.timedelta(days=d), clicks))
+
     spark.sql("CREATE DATABASE IF NOT EXISTS analytics")
     tables = {
         "app_events": (app_events, "ruid string, flight string, event_time date, os string, country string, "
@@ -60,6 +71,7 @@ def build_readme_tables(spark, users=3000, seed=0):
         "purchases": (purchases, "ruid string, event_time timestamp, revenue double"),
         "flight_assignment": (assignment, "ruid string, flight string, exposure_time timestamp, os string, country string"),
         "daily_user_stats": (daily_stats, "user_id string, variant string, ds string, clicks int"),
+        "shared_events": (shared, "ruid string, flight string, event_time date, clicks int"),
     }
     for name, (rows, schema) in tables.items():
         spark.createDataFrame(rows, schema).write.mode("overwrite").saveAsTable(f"analytics.{name}")

@@ -1,8 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-11-10)
 
-- The package metadata links to the author's homepage, https://maxhe.org/.
+Added: one table for many experiments. A row's flight column can list every flight its user is in,
+as many teams log it.
+
+- Set `Columns(flight_separator=",")`, or any separator, for a string column. An array column is read
+  as a list on its own. Spaces around each flight are ignored.
+- Each experiment reads the rows that list one of its own flights and skips the rest. A row that lists
+  two of them counts in both, and `Experiment.validate()` reports it.
+- Rows that name none of the experiment's flights are dropped with a cheap text test before splitting.
+- One flight per row stays the default: an exact match that Spark pushes down to the source, so it
+  still skips other flights' files and partitions.
+
+Also: the package metadata links to the author's homepage, https://maxhe.org/.
 
 ## 0.1.1 (2026-11-06)
 

@@ -27,8 +27,10 @@ needs Java 17.
 
 ## Quick start
 
-`analytics.app_events` carries the flight on every row. This table has one row per user, day and
-media type; any grain at or below user × day works.
+The Spark table `analytics.app_events` has one row per user, day and media type. Its `flight` column
+holds each row's flight assignment, here `control`, `t1` or `t2`. Any grain at or below user × day works,
+and the flight column can also list several flights: see
+[One table for many experiments](#one-table-for-many-experiments).
 
 | ruid | flight  | event_time | os      | country | media_type | clicks | sessions |
 |------|---------|------------|---------|---------|------------|-------:|---------:|
@@ -112,6 +114,31 @@ results = exp.analyze([events, latency])
 * Quantiles pool all rows of a flight, with users as clusters. `method="density"` suits
   integer-valued metrics; see [Methods](#methods).
 
+### One table for many experiments
+
+Many teams log one table for all their experiments and tag every row with each flight its user is in,
+as a comma-separated list. Set `flight_separator` and each experiment reads the rows that list one of
+its own flights, skipping the rest. Flight names must then be unique across experiments.
+
+| ruid | flight           | event_time | clicks |
+|------|------------------|------------|-------:|
+| u1   | search_c,feed_t1 | 2024-03-01 |      3 |
+| u2   | search_t1,feed_c | 2024-03-01 |      0 |
+
+```python
+from breakitdown import Columns
+
+shared = MetricTable("analytics.shared_events", [Count("clicks")], columns=Columns(flight_separator=","))
+search = Experiment(control="search_c", treatments=["search_t1"], start="2024-03-01", end="2024-03-14")
+feed = Experiment(control="feed_c", treatments=["feed_t1"], start="2024-03-01", end="2024-03-14")
+search.analyze(shared).overall()
+feed.analyze(shared).overall()
+```
+
+An array column is read as a list without the setting. Rows that name none of the experiment's flights
+are dropped with a cheap text test before any splitting. Without a separator, breakitdown expects one
+flight per row and matches it exactly, so Spark can skip files and partitions that hold other flights.
+
 ### Joining a flight mapping (opt-in)
 
 Use this when metric tables don't carry the flight, or when users without rows must count as zeros:
@@ -166,7 +193,7 @@ Experiment(control, treatments, start, end, *, user_segments=None, mapping=None,
 
 MetricTable(source, metrics, name="", metric_segments=None, columns=None, inner_join=False, daily=True)
 FlightMapping(source, columns=None)
-Columns(unit="ruid", flight="flight", time="event_time", exposure=None, time_format=None)
+Columns(unit="ruid", flight="flight", time="event_time", exposure=None, time_format=None, flight_separator=None)
 
 Count(col, name="", label="", direction="up")
 Binary(col, name="", label="", direction="up")
@@ -250,7 +277,8 @@ For treatment T and control C, with estimates θ and variances V:
 | `Columns` field | Default | Meaning |
 |-----------------|---------|---------|
 | `unit` | `ruid` | Randomization unit id |
-| `flight` | `flight` | The unit's flight, compared as a string |
+| `flight` | `flight` | The unit's flight, compared as a string. A row can also list several flights: a string (set `flight_separator`) or an array. |
+| `flight_separator` | `None` | Set it, e.g. to `","`, when a string `flight` column lists several flights; spaces around each are ignored. `None`: one flight per row, matched exactly, so Spark can skip other flights' data. |
 | `time` | `event_time` | DATE, TIMESTAMP, string or `yyyyMMdd` integer. Filtered to `start..end` and bucketed by calendar day in the Spark session time zone. |
 | `exposure` | `None` | Optional first-exposure time, with the same types as `time` |
 | `time_format` | `None` | Spark datetime pattern for string or integer times; strings default to `yyyy-MM-dd` |
@@ -270,7 +298,8 @@ Set the columns once on the `Experiment`. A table with a different schema passes
 * **Exposure cut-off:** exact when both `time` and `exposure` are timestamps, by day otherwise.
 * **Several mapping rows per unit:** reduced to one row per unit and flight, keeping the earliest
   exposure and the largest non-null segment value.
-* **Unit in two flights:** counted in both. `exp.validate(table)` reports it.
+* **Unit in two flights:** counted in both, as is a row that lists two of the experiment's flights.
+  `exp.validate(table)` reports it.
 
 ### Grain and segments
 

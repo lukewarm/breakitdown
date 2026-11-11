@@ -123,6 +123,38 @@ def _in_period(day: Column, period: Period) -> Column:
     return day.between(F.lit(period.start), F.lit(period.end))
 
 
+def experiment_flight(df: DataFrame, columns: Columns, flights: Sequence[str]) -> Tuple[Column, Column]:
+    """How to read the flight column: a filter for the experiment's rows, and a row's flight in it.
+
+    One flight per row (no ``flight_separator``) is an exact match, which Spark can push down to the
+    source to skip files, partitions and row groups. A list of flights (an array column, or a string
+    split on ``flight_separator``) is filtered first with a cheap test that drops rows naming none of
+    the experiment's flights; only the rest are split. Its flight is then a generator, one output row
+    per experiment flight the row lists, so a row that lists two counts in both.
+    """
+    names = [str(f) for f in flights]
+    col = F.col(quote(columns.flight))
+    wanted = F.array(*[F.lit(name) for name in names])
+    if isinstance(_field_type(df, columns.flight), T.ArrayType):
+        listed = col.cast("array<string>")
+        return F.arrays_overlap(listed, wanted), F.explode(F.array_intersect(listed, wanted))
+    text = col.cast("string")
+    sep = columns.flight_separator
+    if not sep:
+        return text.isin(names), text
+    mentions = functools.reduce(lambda a, b: a | b, [text.contains(name) for name in names])
+    # Drop the spaces around separators with one regex (compiled once per task), then split on the
+    # separator. Java splits on one plain or escaped character without compiling a pattern per row.
+    tidy = F.regexp_replace(F.trim(text), "\\s*\\Q" + sep + "\\E\\s*", sep.replace("\\", "\\\\").replace("$", "\\$"))
+    if len(sep) > 1:
+        split_on = "\\Q" + sep + "\\E"
+    elif sep in ".$|()[{^?*+\\":
+        split_on = "\\" + sep
+    else:
+        split_on = sep
+    return mentions, F.explode(F.array_intersect(F.split(tidy, split_on), wanted))
+
+
 # ----------------------------------------------------------------------------------- preparation
 
 
@@ -149,8 +181,8 @@ def prejoined_rows(
         where,
     )
     day = day_column(df, columns.time, columns.time_format)
-    flight = F.col(quote(columns.flight)).cast("string")
-    keep = _in_period(day, period) & flight.isin(list(flights)) & F.col(quote(columns.unit)).isNotNull()
+    in_experiment, flight = experiment_flight(df, columns, flights)
+    keep = _in_period(day, period) & in_experiment & F.col(quote(columns.unit)).isNotNull()
     order = F.col(quote(columns.time)) if is_timestamp(df, columns.time) else day
     selects = [F.col(quote(columns.unit)).alias(UNIT), flight.alias(FLIGHT), day.alias(DAY), order.alias(ORDER)]
     if exposure:
@@ -211,15 +243,14 @@ def mapping_rows(df: DataFrame, columns: Columns, flights: Sequence[str], user_c
     """The mapping's rows for the experiment's flights, with internal column names."""
     exposure = columns.exposure
     require_columns(df, [columns.unit, columns.flight, *([exposure] if exposure else []), *user_cols], where)
-    flight = F.col(quote(columns.flight)).cast("string")
+    in_experiment, flight = experiment_flight(df, columns, flights)
     selects = [F.col(quote(columns.unit)).alias(UNIT), flight.alias(FLIGHT)]
     selects += [F.col(quote(c)).cast("string").alias(c) for c in user_cols]
     if exposure:
         selects.append(day_column(df, exposure, columns.time_format).alias(EXPOSURE_DAY))
         if is_timestamp(df, exposure):
             selects.append(F.col(quote(exposure)).alias(EXPOSURE_TS))
-    keep = flight.isin(list(flights)) & F.col(quote(columns.unit)).isNotNull()
-    return df.where(keep).select(*selects)
+    return df.where(in_experiment & F.col(quote(columns.unit)).isNotNull()).select(*selects)
 
 
 def prepare_mapping(
