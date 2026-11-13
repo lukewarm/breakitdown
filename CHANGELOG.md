@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.1 (2026-11-12)
+
+Faster analyses (#1). Results don't change, apart from one edge case in flight lists, below.
+
+- A pre-joined table is read once per analysis instead of two or three times. The population now comes
+  from the cached rows, and each user's segment values are joined to the per-user rollups rather than to
+  every row.
+- Each per-user rollup is computed once for all user segment breakdowns, not once per breakdown.
+- A flight list split on `flight_separator` runs the regex that drops spaces around flights only on
+  rows that contain a space, which makes splitting several times faster. The edge case: in a row
+  without a space, a tab or newline next to a separator is now kept, so that flight no longer matches.
+
 ## 0.3.0 (2026-11-10)
 
 Added:

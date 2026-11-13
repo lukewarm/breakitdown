@@ -240,8 +240,8 @@ class Experiment:
         prepared = self._prepare(table, spark, mapping_population)
         cached: List[DataFrame] = []
         if cache:
-            prepared = aggregate.Prepared(prepared.rows.persist(), prepared.population.persist())
-            cached = [prepared.rows, prepared.population]
+            # Rows first: a pre-joined population is derived from them, so it then reads them from the cache.
+            cached = [prepared.rows.persist(), prepared.population.persist()]
         try:
             granularities = (CUMULATIVE, DAILY) if daily and table.daily else (CUMULATIVE,)
             counts = aggregate.population_counts(prepared.population, self.period, self.user_segments, DAILY in granularities)

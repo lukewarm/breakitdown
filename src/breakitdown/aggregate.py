@@ -12,8 +12,11 @@ Per MetricTable, everything stays lazy until a single collect per job::
 Sufficient statistics are sums over units *with* rows; the denominators come from the population,
 so units without rows count as zeros without ever being materialised.
 
-Pre-joined mode builds both ``rows`` and ``population`` from the metric table. Mapping mode joins
-the metric rows to the mapping and takes the population from the mapping.
+Pre-joined mode takes ``rows`` from the metric table as they are and derives ``population`` from
+them, so with the rows cached the table is read once. Each unit's user segment values come from the
+population and are joined to the unit-level rollups, which are far smaller than the rows. Mapping
+mode joins the metric rows to the mapping, which brings the user segments, and takes the population
+from the mapping.
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ ORDER = "__order"  # a row's time, for finding each unit's earliest row
 EXPOSURE_TS = "__exposure_ts"
 FIRST_DAY = "__first_day"
 VALUE = "__value"
+USER_SEGMENT = "__user_segment"  # a struct: a user segment grouping's name and a unit's value in it
 
 CUMULATIVE = "cumulative"
 DAILY = "daily"
@@ -52,9 +56,33 @@ _INTEGRAL_TYPES = (T.ByteType, T.ShortType, T.IntegerType, T.LongType)
 @dataclass
 class Prepared:
     rows: DataFrame
-    """UNIT, FLIGHT, DAY, user segment columns, metric segment columns, metric input columns."""
+    """UNIT, FLIGHT, DAY, metric segment columns, metric input columns and, unless ``segments`` is set,
+    the user segment columns."""
     population: DataFrame
     """UNIT, FLIGHT, FIRST_DAY, user segment columns: one row per unit and flight."""
+    segments: Optional[DataFrame] = None
+    """UNIT, FLIGHT and the user segment columns of the population's units. Set when ``rows`` are a
+    pre-joined table's rows as read: their own user segment columns then hold the raw values the
+    population is derived from, and they still include units the population leaves out. Take rows
+    through ``unit_rollup`` or ``select_rows``, which join this in."""
+
+    def unit_rollup(self, keys: Sequence[str], aggregations: Sequence[Column], user_cols: Sequence[str]) -> DataFrame:
+        """``aggregations`` of the rows per UNIT, FLIGHT and ``keys``, with the user segment columns.
+
+        ``segments`` are joined after the rollup, where both sides have a row per unit rather than per
+        input row.
+        """
+        if self.segments is None:
+            return self.rows.groupBy(*_cols((UNIT, FLIGHT, *user_cols, *keys))).agg(*aggregations)
+        units = self.rows.groupBy(*_cols((UNIT, FLIGHT, *keys))).agg(*aggregations)
+        return units.join(self.segments, on=[UNIT, FLIGHT], how="inner")
+
+    def select_rows(self, condition: Column, columns: Sequence[Column], user_cols: Sequence[str]) -> DataFrame:
+        """``columns`` (UNIT and FLIGHT among them) of the rows meeting ``condition``, with the user segment columns."""
+        rows = self.rows.where(condition)
+        if self.segments is None:
+            return rows.select(*columns, *_cols(user_cols))
+        return rows.select(*columns).join(self.segments, on=[UNIT, FLIGHT], how="inner")
 
 
 # --------------------------------------------------------------------------------------------- helpers
@@ -145,8 +173,10 @@ def experiment_flight(df: DataFrame, columns: Columns, flights: Sequence[str]) -
         return text.isin(names), text
     mentions = functools.reduce(lambda a, b: a | b, [text.contains(name) for name in names])
     # Drop the spaces around separators with one regex (compiled once per task), then split on the
-    # separator. Java splits on one plain or escaped character without compiling a pattern per row.
+    # separator. The regex costs several times the split, so rows without a space skip it. Java splits
+    # on one plain or escaped character without compiling a pattern per row.
     tidy = F.regexp_replace(F.trim(text), "\\s*\\Q" + sep + "\\E\\s*", sep.replace("\\", "\\\\").replace("$", "\\$"))
+    tidy = F.when(text.contains(" "), tidy).otherwise(text)
     if len(sep) > 1:
         split_on = "\\Q" + sep + "\\E"
     elif sep in ".$|()[{^?*+\\":
@@ -224,26 +254,24 @@ def prepare_prejoined(
 ) -> Prepared:
     """Rows and population of a table that already carries flight and user segments on every row.
 
+    The population is derived from the rows, so once the rows are cached the table is not read again.
     Every unit gets exactly one value per user segment column, taken from its earliest row (the value
-    closest to exposure). Rows then carry that value, so a breakdown never splits a unit and adding one
-    never changes the overall results. Units seen in more than one flight are left out unless
-    ``exclude_multi_flight_units`` is False, in which case they count in each.
+    closest to exposure), and the rollups take it from ``segments``, so a breakdown never splits a unit
+    and adding one never changes the overall results. Units seen in more than one flight are left out
+    unless ``exclude_multi_flight_units`` is False, in which case they count in each.
     """
-    raw = prejoined_rows(df, columns, period, flights, user_cols, metric_segment_cols, inputs, where)
+    rows = prejoined_rows(df, columns, period, flights, user_cols, metric_segment_cols, inputs, where)
     first_day = F.coalesce(F.min(EXPOSURE_DAY), F.min(DAY)) if columns.exposure else F.min(DAY)
     population = (
-        raw.groupBy(UNIT, FLIGHT)
+        rows.groupBy(UNIT, FLIGHT)
         .agg(first_day.alias(FIRST_DAY), *[_earliest_value(c) for c in user_cols])
         .withColumn(FIRST_DAY, F.greatest(F.col(FIRST_DAY), F.lit(period.start)))
     )
     if exclude_multi_flight_units:
         population = single_flight_units(population)
-    rows = raw.drop(ORDER, *([EXPOSURE_DAY] if columns.exposure else []), *user_cols)
-    if user_cols:
-        rows = rows.join(population.select(*_cols((UNIT, FLIGHT, *user_cols))), on=[UNIT, FLIGHT], how="inner")
-    elif exclude_multi_flight_units:
-        rows = rows.join(population.select(UNIT, FLIGHT), on=[UNIT, FLIGHT], how="left_semi")
-    return Prepared(rows, population)
+    if not user_cols and not exclude_multi_flight_units:
+        return Prepared(rows, population)  # every unit in the rows is in the population, unsegmented
+    return Prepared(rows, population, population.select(*_cols((UNIT, FLIGHT, *user_cols))))
 
 
 def single_flight_units(population: DataFrame) -> DataFrame:
@@ -362,28 +390,34 @@ def prepare_joined(
 # ------------------------------------------------------------------------------- sufficient statistics
 
 
+def _segment_label(spec: SegmentSpec) -> Tuple[Column, Column]:
+    """A segment grouping's name and value, as columns; the value joins the spec's columns with SEPARATOR."""
+    return F.lit(segment_name(spec)), (F.concat_ws(SEPARATOR, *_cols(spec)) if spec else F.lit(OVERALL))
+
+
 def _label(
     df: DataFrame,
     period: Period,
     granularity: str,
-    user_spec: SegmentSpec,
+    user: Tuple[Column, Column],
     metric_spec: SegmentSpec,
     stat_names: Sequence[str],
 ) -> DataFrame:
-    """Put a grouped result into the common schema so all groupings can be unioned and collected once."""
+    """Put a grouped result into the common schema so all groupings can be unioned and collected once.
 
-    def value(spec: SegmentSpec) -> Column:
-        return F.concat_ws(SEPARATOR, *_cols(spec)) if spec else F.lit(OVERALL)
-
+    ``user`` is the user segment grouping's name and value, as ``_segment_label`` gives them.
+    """
     day = F.col(DAY) if granularity == DAILY else F.lit(None).cast("date")
+    user_segment, user_value = user
+    metric_segment, metric_value = _segment_label(metric_spec)
     return df.select(
         F.lit(period.name).alias("period"),
         F.lit(granularity).alias("granularity"),
         day.alias("day"),
-        F.lit(segment_name(user_spec)).alias("user_segment"),
-        value(user_spec).alias("user_segment_value"),
-        F.lit(segment_name(metric_spec)).alias("metric_segment"),
-        value(metric_spec).alias("metric_segment_value"),
+        user_segment.alias("user_segment"),
+        user_value.alias("user_segment_value"),
+        metric_segment.alias("metric_segment"),
+        metric_value.alias("metric_segment_value"),
         F.col(FLIGHT).alias("flight"),
         F.col("__units_with_data").alias("units_with_data"),
         *_cols(stat_names),
@@ -398,28 +432,34 @@ def unit_metric_stats(
     metric_specs: Sequence[SegmentSpec],
     granularities: Sequence[str],
 ) -> DataFrame:
-    """Sufficient statistics of all Count/Binary/Ratio metrics of a table, for every grouping."""
+    """Sufficient statistics of all Count/Binary/Ratio/MeanRatio metrics of a table, for every grouping."""
     user_cols = segment_columns(user_specs)
     unit_aggs: Dict[str, Column] = {}
     group_aggs: Dict[str, Column] = {}
     for key, metric in keyed_metrics:
         unit_aggs.update(metric.unit_aggregations(key))
         group_aggs.update(metric.group_aggregations(key))
+    # Each unit is in overall and in one value of every user segment grouping. Exploding those labels
+    # gives it a row per grouping, so one aggregation of one rollup fills them all; aggregating per
+    # grouping would roll the rows up again for each.
+    groupings = F.explode(F.array(*[
+        F.struct(name.alias("name"), value.alias("value"))
+        for name, value in map(_segment_label, ((),) + tuple(user_specs))
+    ]))
+    user = (F.col(USER_SEGMENT)["name"], F.col(USER_SEGMENT)["value"])
     parts = []
     for metric_spec in ((),) + tuple(metric_specs):
         for granularity in granularities:
             day = (DAY,) if granularity == DAILY else ()
-            # User segment columns are unit attributes, so keeping them all in the unit key does not
-            # change its grain; every user-segment grouping below reuses this one rollup.
-            units = prepared.rows.groupBy(*_cols((UNIT, FLIGHT, *user_cols, *metric_spec, *day))).agg(
-                *[expr.alias(name) for name, expr in unit_aggs.items()]
+            units = prepared.unit_rollup(
+                (*metric_spec, *day), [expr.alias(name) for name, expr in unit_aggs.items()], user_cols
             )
-            for user_spec in ((),) + tuple(user_specs):
-                grouped = units.groupBy(*_cols((FLIGHT, *user_spec, *metric_spec, *day))).agg(
-                    F.count(F.lit(1)).alias("__units_with_data"),
-                    *[expr.alias(name) for name, expr in group_aggs.items()],
-                )
-                parts.append(_label(grouped, period, granularity, user_spec, metric_spec, list(group_aggs)))
+            grouped = (
+                units.select("*", groupings.alias(USER_SEGMENT))
+                .groupBy(*_cols((FLIGHT, USER_SEGMENT, *metric_spec, *day)))
+                .agg(F.count(F.lit(1)).alias("__units_with_data"), *[expr.alias(name) for name, expr in group_aggs.items()])
+            )
+            parts.append(_label(grouped, period, granularity, user, metric_spec, list(group_aggs)))
     return _union(parts)
 
 
@@ -498,8 +538,10 @@ def quantile_stats(
     user_cols = segment_columns(user_specs)
     metric_cols = segment_columns(metric_specs)
     raw = F.col(quote(metric.col))
-    events = prepared.rows.where(raw.isNotNull() & ~F.isnan(raw.cast("double"))).select(
-        *_cols((UNIT, FLIGHT, DAY, *user_cols, *metric_cols)), metric.value().alias(VALUE)
+    events = prepared.select_rows(
+        raw.isNotNull() & ~F.isnan(raw.cast("double")),
+        [*_cols((UNIT, FLIGHT, DAY, *metric_cols)), metric.value().alias(VALUE)],
+        user_cols,
     )
     find_quantiles = _interpolated_quantiles if metric.method == QuantileMethod.DENSITY else _approx_quantiles
     outputs = metric.outputs(key)
@@ -535,7 +577,7 @@ def quantile_stats(
                     F.count(F.lit(1)).alias("__units_with_data"),
                     *[expr.alias(name) for name, expr in group_aggs.items()],
                 )
-                parts.append(_label(grouped, period, granularity, user_spec, metric_spec, list(group_aggs)))
+                parts.append(_label(grouped, period, granularity, _segment_label(user_spec), metric_spec, list(group_aggs)))
     return _union(parts)
 
 
@@ -551,12 +593,12 @@ def population_counts(
     """Units per flight and user segment: overall (cumulative) and exposed-by-day (daily)."""
     parts = []
     for spec in ((),) + tuple(user_specs):
-        value = F.concat_ws(SEPARATOR, *_cols(spec)) if spec else F.lit(OVERALL)
+        name, value = _segment_label(spec)
         parts.append(
             population.groupBy(*_cols((FLIGHT, *spec, FIRST_DAY)))
             .agg(F.count(F.lit(1)).alias("n"))
             .select(
-                F.lit(segment_name(spec)).alias("user_segment"),
+                name.alias("user_segment"),
                 value.alias("user_segment_value"),
                 F.col(FLIGHT).alias("flight"),
                 F.col(FIRST_DAY).alias("first_day"),

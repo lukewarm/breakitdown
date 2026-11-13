@@ -364,12 +364,12 @@ Planned. The code already leaves a place for each:
 | Plots (forest, daily trend) | A `plots.py` over the tidy `results.table`. |
 | Ordinal HTE "trend" pattern | Mark a user segment as ordinal, then extend `compare._hte_pattern`. |
 | Sequential testing | Another inference function next to `stats.compare`. |
-| Very wide breakdowns | Replace the per-grouping aggregations plus union in `aggregate.py` with `GROUPING SETS`. |
+| Very wide breakdowns | `aggregate.quantile_stats` still makes a pass per user-segment grouping. Label each row with all its groupings, as `unit_metric_stats` does for units. |
 
 ## Design
 
 ```text
-source ─► rows (unit, flight, day, segments, metric inputs)    pre-joined: rows and population from the table
+source ─► rows (unit, flight, day, segments, metric inputs)    pre-joined: the table's rows, population from them
        └► population (one row per unit and flight)              mapping: rows ⋈ mapping, population from the mapping
 
 rows ─► unit rollup (unit [× day] [× metric segment]) ─► sufficient statistics per flight × segment [× day]
@@ -379,8 +379,10 @@ population ─► units per flight × user segment [× exposure day]   (denomina
                     pandas/numpy: estimates ─► compare ─► BH, HTE, contributions ─► ExperimentResults
 ```
 
-* **Spark:** all groupings of a table are unioned and collected once. The unit-level shuffle is
-  reused across user-segment groupings.
+* **Spark:** each table is read once. Its rows are cached and, in pre-joined mode, the population is
+  derived from them; each unit's user segments are joined to its rollup rather than to every row. One
+  rollup per metric segment and day feeds all user-segment groupings, and all groupings of a table are
+  unioned and collected once.
 * **Statistics:** `stats.py` is plain numpy, vectorised over all groups.
 * **Modules** (in `src/breakitdown/`):
   * `experiment.py`: `Experiment`
